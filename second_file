@@ -1,0 +1,266 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.sparse import lil_matrix, eye, diags, kron
+from scipy.sparse.linalg import spsolve
+import time
+
+
+# =============================================================================
+# 1. Configuration & Parameters
+# =============================================================================
+
+
+class Config:
+   def __init__(self):
+       # Physical Parameters
+       self.L = 50.0          # Domain length (cm)
+       self.D = 5.0           # Depth (cm)
+       self.g = 980.0         # Gravity (cm/s^2)
+       self.sigma = 74.9      # Surface tension (dyne/cm)
+       self.rho = 1.0         # Density (g/cm^3)
+       self.nu = 0.1          # Viscosity (cm^2/s) - High value to see decay fast
+
+
+       # Numerical Parameters
+       self.nx = 100          # Grid points in x
+       self.nz = 30           # Grid points in z
+       self.dt = 0.005        # Time step (s)
+       self.nt = 1000         # Total time steps
+      
+       # Derived
+       self.dx = self.L / self.nx
+       self.dz = self.D / self.nz
+
+
+# =============================================================================
+# 2. Solver Implementation (Refactored Style)
+# =============================================================================
+
+
+class LNSSolver:
+   def __init__(self, cfg):
+       self.cfg = cfg
+      
+       # State Arrays
+       self.eta = np.zeros(cfg.nx)             # Surface elevation
+       self.phi = np.zeros(cfg.nx * cfg.nz)    # Potential (flattened)
+       self.w3 = np.zeros(cfg.nx * cfg.nz)     # Vertical vorticity (flattened)
+      
+       # Build Operators
+       self._build_operators()
+       self._build_implicit_matrices()
+      
+   def _build_operators(self):
+       """Construct basic sparse derivative matrices."""
+       nx, nz = self.cfg.nx, self.cfg.nz
+       dx, dz = self.cfg.dx, self.cfg.dz
+      
+       # 1D Horizontal Laplacian (Periodic)
+       e = np.ones(nx)
+       data = np.vstack([e, -2*e, e]) / dx**2
+       self.D2x = diags(data, [-1, 0, 1], shape=(nx, nx)).tolil()
+       self.D2x[0, -1] = 1.0/dx**2; self.D2x[-1, 0] = 1.0/dx**2
+       self.D2x = self.D2x.tocsr()
+      
+       # 2D Laplacian (D2x + D2z) construction
+       # Note: We build this manually to ensure correct Kronecker structure
+       I_z = eye(nz)
+       I_x = eye(nx)
+      
+       # Vertical 2nd derivative (Internal)
+       e_z = np.ones(nz)
+       data_z = np.vstack([e_z, -2*e_z, e_z]) / dz**2
+       D2z_1d = diags(data_z, [-1, 0, 1], shape=(nz, nz))
+      
+       self.Lap2D = (kron(I_z, self.D2x) + kron(D2z_1d, I_x)).tolil()
+       self.Lap2D = self.Lap2D.tocsr()
+
+
+   def _build_implicit_matrices(self):
+       """Build matrices for the implicit time stepping."""
+       nx, nz = self.cfg.nx, self.cfg.nz
+      
+       # --- Matrix 1: Heat Equation for w3 ---
+       # (I - dt*nu*Lap) w3 = RHS
+       # BCs are handled by modifying rows
+       self.M_heat = (eye(nx*nz) - self.cfg.dt * self.cfg.nu * self.Lap2D).tolil()
+      
+       # Apply BC Rows
+       for i in range(nx):
+           # Bottom (z=0): Dirichlet-like placeholder (value set in loop)
+           # Implements w3 = -phi_z
+           idx_bot = i
+           self.M_heat[idx_bot, :] = 0
+           self.M_heat[idx_bot, idx_bot] = 1.0
+          
+           # Top (z=D): Dirichlet-like placeholder
+           # Implements w3 = 2*nu*eta_xx
+           idx_top = (nz-1)*nx + i
+           self.M_heat[idx_top, :] = 0
+           self.M_heat[idx_top, idx_top] = 1.0
+          
+       self.M_heat = self.M_heat.tocsr()
+      
+       # --- Matrix 2: Laplace for Phi ---
+       # Delta phi = 0
+       self.M_lap = self.Lap2D.tolil()
+      
+       for i in range(nx):
+           # Bottom (z=0): Neumann-ish (phi_z = -w3)
+           # FD: (phi_1 - phi_0)/dz = -w3  =>  phi_1 - phi_0 = -dz*w3
+           idx_0 = i
+           idx_1 = nx + i
+           self.M_lap[idx_0, :] = 0
+           self.M_lap[idx_0, idx_1] = 1.0
+           self.M_lap[idx_0, idx_0] = -1.0
+          
+           # Top (z=D): Dirichlet (phi = phi_surf)
+           idx_top = (nz-1)*nx + i
+           self.M_lap[idx_top, :] = 0
+           self.M_lap[idx_top, idx_top] = 1.0
+          
+       self.M_lap = self.M_lap.tocsr()
+
+
+   def step(self):
+       """Execute one time step."""
+       nx, nz = self.cfg.nx, self.cfg.nz
+       dt = self.cfg.dt
+      
+       # 1. Solve Heat Equation for w3
+       # -----------------------------
+       # Top BC: w3 = 2 * nu * eta_xx (Approximate vorticity source at surface)
+       eta_xx = self.D2x.dot(self.eta)
+       w3_top = 2 * self.cfg.nu * eta_xx
+      
+       # Bottom BC: w3 = -phi_z (Non-slip)
+       # Calculate phi_z using current phi
+       phi_bot_0 = self.phi[:nx]
+       phi_bot_1 = self.phi[nx:2*nx]
+       phi_z_bot = (phi_bot_1 - phi_bot_0) / self.cfg.dz
+       w3_bot = -phi_z_bot
+      
+       # Construct RHS
+       rhs_w3 = self.w3.copy()
+       # Enforce BC values in RHS vector
+       rhs_w3[:nx] = w3_bot
+       rhs_w3[(nz-1)*nx:] = w3_top
+      
+       self.w3 = spsolve(self.M_heat, rhs_w3)
+      
+       # 2. Update Surface Potential (Phi_surf)
+       # --------------------------------------
+       # Explicit step: phi_t = -g*eta + (sigma/rho)*kappa + 2*nu*Delta_H(phi)
+       phi_surf = self.phi[(nz-1)*nx:]
+       kappa = self.D2x.dot(self.eta) # Linear curvature
+       lap_phi = self.D2x.dot(phi_surf)
+      
+       phi_t = -self.cfg.g * self.eta + (self.cfg.sigma/self.cfg.rho)*kappa + 2*self.cfg.nu*lap_phi
+       phi_surf_new = phi_surf + dt * phi_t
+      
+       # 3. Solve Laplace for Bulk Potential
+       # -----------------------------------
+       rhs_phi = np.zeros(nx*nz)
+       # Bottom BC: phi_1 - phi_0 = -dz * w3 (using NEW w3)
+       rhs_phi[:nx] = -self.cfg.dz * self.w3[:nx]
+       # Top BC: phi = phi_surf_new
+       rhs_phi[(nz-1)*nx:] = phi_surf_new
+      
+       self.phi = spsolve(self.M_lap, rhs_phi)
+      
+       # 4. Update Surface Elevation
+       # ---------------------------
+       # eta_t = phi_z + w3 (Kinematic BC)
+       phi_top = self.phi[(nz-1)*nx:]
+       phi_below = self.phi[(nz-2)*nx:(nz-1)*nx]
+       phi_z_surf = (phi_top - phi_below) / self.cfg.dz
+      
+       w3_surf = self.w3[(nz-1)*nx:]
+      
+       self.eta = self.eta + dt * (phi_z_surf + w3_surf)
+
+
+# =============================================================================
+# 3. Verification & Plotting
+# =============================================================================
+
+
+def run_verification():
+   # Setup
+   cfg = Config()
+   solver = LNSSolver(cfg)
+  
+   # Initial Condition: Sine Wave
+   k_mode = 2
+   k = 2 * np.pi * k_mode / cfg.L
+   x = np.linspace(0, cfg.L, cfg.nx, endpoint=False)
+   solver.eta = 0.1 * np.cos(k * x) # Amplitude 0.1
+  
+   print(f"Running Sine Wave Verification (k={k:.3f}, nu={cfg.nu})...")
+  
+   # History
+   times = []
+   amps = []
+  
+   start = time.time()
+   for i in range(cfg.nt):
+       solver.step()
+       if i % 10 == 0:
+           times.append(i * cfg.dt)
+           amps.append(np.max(np.abs(solver.eta)))
+          
+   print(f"Simulation complete in {time.time()-start:.2f}s")
+  
+   # --- Analytical Solution ---
+   times = np.array(times)
+  
+   # 1. Frequency (Dispersion Relation)
+   omega_sq = (cfg.g * k + cfg.sigma * k**3 / cfg.rho) * np.tanh(k * cfg.D)
+   omega = np.sqrt(omega_sq)
+  
+   # 2. Decay Rate (Viscous)
+   # Gamma = Bulk Dissipation + Bottom Boundary Layer Dissipation
+   gamma_bulk = 2 * cfg.nu * k**2
+   gamma_bot = (k / (2 * np.sinh(2 * k * cfg.D))) * np.sqrt(cfg.nu * omega / 2)
+   gamma_total = gamma_bulk + gamma_bot
+  
+   theory_decay = amps[0] * np.exp(-gamma_total * times)
+  
+   # --- Plotting ---
+   fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+  
+   # Plot 1: Amplitude Decay
+   ax1.plot(times, amps, 'b-', lw=2, label='Simulation (Envelope)')
+   ax1.plot(times, theory_decay, 'r--', lw=2, label=f'Theory (Exp decay)')
+   ax1.set_title("Amplitude Decay Validation")
+   ax1.set_xlabel("Time (s)")
+   ax1.set_ylabel("Amplitude")
+   ax1.legend()
+   ax1.grid(True, alpha=0.3)
+  
+   # Plot 2: Frequency Check (Zoomed in)
+   # Just plotting a few points to check phase
+   ax2.plot(times[:50], amps[:50], 'b.-', label='Sim Magnitude')
+   # Note: We can't easily plot phase without the raw signal,
+   # but if the decay matches, physics is usually good.
+   # Let's verify the decay error at the end
+   error = abs(amps[-1] - theory_decay[-1]) / theory_decay[-1] * 100
+  
+   text_str = '\n'.join((
+       f'Wavenumber k: {k:.3f}',
+       f'Frequency w: {omega:.3f}',
+       f'Decay rate: {gamma_total:.4f}',
+       f'Final Error: {error:.2f}%'
+   ))
+   ax2.text(0.1, 0.5, text_str, transform=ax2.transAxes, fontsize=12,
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+   ax2.axis('off')
+   ax2.set_title("Parameters & Error Stats")
+  
+   plt.tight_layout()
+   plt.show()
+
+
+if __name__ == "__main__":
+   run_verification()
+
