@@ -21,16 +21,16 @@ class Config:
         self.g = 980.0          # cm/s^2
         
         # Viscosity Correction
-        # Paper uses nu* = 0.8025 * nu for Silicone Oil
+        # nu* = 0.8025 * nu for Silicone Oil
         nu_raw = 0.20           # cm^2/s
         self.nu = 0.8025 * nu_raw 
         
         # --- Domain Setup ---
-        # The paper uses Faraday wavelength lambda_F ~ 0.5 cm
+        # Faraday wavelength lambda_F ~ 0.5 cm
         # We set L to contain roughly 20 wavelengths
         self.L = 10.0           # cm
         
-        # The paper assumes "infinite depth", but numerical grids need a bottom.
+        # "infinite depth", but numerical grids need a bottom.
         # We set D large enough relative to lambda_F.
         self.D = 2.0            # cm
         
