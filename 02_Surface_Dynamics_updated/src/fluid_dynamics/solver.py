@@ -166,7 +166,15 @@ class FluidSolver:
         w1_flat = state.w1.flatten()
         w1_new_flat = self._solve_sparse(A_heat, w1_flat)
         w1_new = w1_new_flat.reshape((self.nz, self.nx))
-        
+        # Apply BCs for w¹
+        # Top: "Complicated condition" - zero tangential stress, coupling w1 and w3
+        # From LNS: w1_z + w3_x = 0 at z=0, so roughly w1 depends on horizontal gradient of w3.
+        for j in range(self.nx):
+            w3_x_surf = (w3_new[-1, (j + 1) % self.nx] - 
+                         w3_new[-1, (j - 1) % self.nx]) / (2 * dx)
+            # Extrapolating to enforce w1_z = -w3_x
+            w1_new[-1, j] = w1_new[-2, j] - dz * w3_x_surf
+            
         # Bottom BC for w¹: non-slip u_x = 0, so w¹ = -∂φ/∂x
         for j in range(self.nx):
             phi_x_bottom = (state.phi[0, (j + 1) % self.nx] - 

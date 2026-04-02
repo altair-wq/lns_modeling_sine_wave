@@ -56,6 +56,8 @@ class LNSSolver:
         self.eta = np.zeros(cfg.nx)
         self.phi = np.zeros(cfg.nx * cfg.nz)
         self.w3 = np.zeros(cfg.nx * cfg.nz)
+        self.w1 = np.zeros(cfg.nx * cfg.nz)
+        self.P_ext = np.zeros(cfg.nx)
         
         self._build_operators()
         self._build_implicit_matrices()
@@ -95,14 +97,28 @@ class LNSSolver:
             self.M_heat[idx_top, :] = 0; self.M_heat[idx_top, idx_top] = 1.0
         self.M_heat = self.M_heat.tocsr()
         
+        # --- M_heat_w1: Diffusion of Vorticity (w1) ---
+        self.M_heat_w1 = (eye(nx*nz) - self.cfg.dt * self.cfg.nu * self.Lap2D).tolil()
+        
+        for i in range(nx):
+            # Bottom (i): w1 = -phi_x (Non-slip condition)
+            self.M_heat_w1[i, :] = 0; self.M_heat_w1[i, i] = 1.0
+            
+            # Top (i_top): w1_z = -w3_x (Zero-shear stress condition)
+            idx_top = (nz-1)*nx + i
+            self.M_heat_w1[idx_top, :] = 0
+            self.M_heat_w1[idx_top, idx_top] = 1.0
+            self.M_heat_w1[idx_top, idx_top - nx] = -1.0
+        self.M_heat_w1 = self.M_heat_w1.tocsr()
+        
         # --- M_lap: Pressure/Potential (phi) ---
         # Matches Eq (2.20a): Laplacian(phi) = 0
         self.M_lap = self.Lap2D.tolil()
         
         for i in range(nx):
-            # Bottom (i): phi_z = -w3 
-            self.M_lap[i, :] = 0
-            self.M_lap[i, i] = -1.0; self.M_lap[i, i+nx] = 1.0
+            # Bottom (i): phi_z = -w3 with 2nd-order ghost node calculation
+            self.M_lap[i, :] = self.Lap2D[i, :]
+            self.M_lap[i, i+nx] += 1.0 / self.cfg.dz**2
             
             # Top (i_top): phi = phi_surf
             idx_top = (nz-1)*nx + i
@@ -116,8 +132,8 @@ class LNSSolver:
         eta_xx = self.D2x.dot(self.eta)
         w3_top = 2 * self.cfg.nu * eta_xx # Eq (2.17)
         
-        # Bottom BC: w3 = -phi_z
-        phi_bot_z = (self.phi[nx:2*nx] - self.phi[:nx]) / self.cfg.dz
+        # Bottom BC: w3 = -phi_z (using 2nd-order backward offset for accuracy)
+        phi_bot_z = (-3*self.phi[:nx] + 4*self.phi[nx:2*nx] - self.phi[2*nx:3*nx]) / (2 * self.cfg.dz)
         w3_bot = -phi_bot_z
         
         rhs_w3 = self.w3.copy()
@@ -125,18 +141,30 @@ class LNSSolver:
         rhs_w3[(nz-1)*nx:] = w3_top
         self.w3 = spsolve(self.M_heat, rhs_w3)
         
+        # 1.5 Update w1 (Heat Eq)
+        phi_bot = self.phi[:nx]
+        w1_bot = -(np.roll(phi_bot, -1) - np.roll(phi_bot, 1)) / (2 * self.cfg.dx)
+        
+        w3_top_vals = self.w3[(nz-1)*nx:]
+        w3_x_top = (np.roll(w3_top_vals, -1) - np.roll(w3_top_vals, 1)) / (2 * self.cfg.dx)
+        
+        rhs_w1 = self.w1.copy()
+        rhs_w1[:nx] = w1_bot
+        rhs_w1[(nz-1)*nx:] = -self.cfg.dz * w3_x_top
+        self.w1 = spsolve(self.M_heat_w1, rhs_w1)
+        
         # 2. Update Surface Potential (Explicit Dynamic BC)
         # Matches Eq (2.24b)
         phi_surf = self.phi[(nz-1)*nx:]
         kappa = self.D2x.dot(self.eta)
         lap_phi_surf = self.D2x.dot(phi_surf)
         
-        phi_t = -self.cfg.g * self.eta + (self.cfg.sigma/self.cfg.rho)*kappa + 2*self.cfg.nu*lap_phi_surf
+        phi_t = -self.cfg.g * self.eta + (self.cfg.sigma/self.cfg.rho)*kappa + 2*self.cfg.nu*lap_phi_surf - (self.P_ext / self.cfg.rho)
         phi_surf_new = phi_surf + dt * phi_t
         
         # 3. Update Bulk Potential (Laplace Eq)
         rhs_phi = np.zeros(nx*nz)
-        rhs_phi[:nx] = -self.cfg.dz * self.w3[:nx] # Bottom BC
+        rhs_phi[:nx] = -(2.0 / self.cfg.dz) * self.w3[:nx] # Bottom BC (Ghost nodes)
         rhs_phi[(nz-1)*nx:] = phi_surf_new         # Top BC
         self.phi = spsolve(self.M_lap, rhs_phi)
         

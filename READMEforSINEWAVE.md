@@ -1,4 +1,3 @@
-"""
 =============================================================================
 VERIFICATION MODULE DOCUMENTATION
 =============================================================================
@@ -60,7 +59,31 @@ and bottom boundary layer friction.
        gamma_bottom = (k / (2 * sinh(2*k*D))) * sqrt(nu * omega / 2)
 
 -----------------------------------------------------------------------------
-3. REFERENCES
+3. NUMERICAL IMPLEMENTATION & BOUNDARY CONDITIONS
+-----------------------------------------------------------------------------
+The solver utilizes a finite difference grid to calculate the fluid dynamics, 
+incorporating several advanced numerical techniques for stability and accuracy:
+
+* Time Stepping (BDF2): 
+  The temporal evolution of the surface and potential is handled using a 
+  Second-Order Backward Differentiation Formula (BDF2) rather than a basic 
+  Forward Euler loop, ensuring stability over long simulation periods.
+
+* Surface Boundary (Free Surface):
+  - Zero-Shear Stress: Horizontal friction (w1) is actively calculated and 
+    coupled to the vertical friction (w3) via the condition w1_z + w3_x = 0, 
+    allowing accurate surface deformation.
+  - External Pressure (P_ext): The dynamic boundary condition includes an 
+    external pressure array. While zero during wave verification, this serves 
+    as the integration point for upcoming solid-fluid collision modeling.
+
+* Bottom Boundary (Solid Floor):
+  - Ghost Nodes: The Neumann boundary condition for the potential (phi_z = -w3) 
+    is computed using a second-order accurate, 3-point backward difference 
+    stencil (Ghost Nodes) to minimize energy leakage at the floor.
+
+-----------------------------------------------------------------------------
+4. REFERENCES
 -----------------------------------------------------------------------------
 * Simulation Model: 
   Galeano-Rios, C. A., Milewski, P. A., & Vanden-Broeck, J.-M. (2017). 
@@ -69,4 +92,3 @@ and bottom boundary layer friction.
 
 * Decay Formulas: 
   Lamb, H. (1932). "Hydrodynamics". Cambridge University Press.
-"""
