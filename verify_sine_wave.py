@@ -45,6 +45,12 @@ class Config:
         # Derived
         self.dx = self.L / self.nx
         self.dz = self.D / self.nz
+        
+        # --- Sphere Parameters (Galeano-Rios 2017) ---
+        self.R = 0.05               # Radius of the sphere (cm)
+        self.rho_s = 1.2            # Density of the sphere (e.g., slightly denser than fluid)
+        self.volume = (4/3) * np.pi * self.R**3
+        self.m = self.rho_s * self.volume     # Mass of the sphere
 
 # =============================================================================
 # 2. Solver Implementation (LNS System)
@@ -175,8 +181,29 @@ class LNSSolver:
         self.eta = self.eta + dt * (phi_z_surf + w3_surf)
 
 # =============================================================================
-# 3. Verification Routine
+# 3. Verification Routine & Sphere Impact Simulation
 # =============================================================================
+
+def calculate_hertzian_pressure(x_grid, eta, Z_c, X_c, R, stiffness=500.0):
+    """
+    Calculates the external pressure applied by a solid sphere on the fluid surface.
+    """
+    P_ext = np.zeros_like(x_grid)
+    
+    for i, x in enumerate(x_grid):
+        # Check if the grid point is under the sphere
+        if abs(x - X_c) < R:
+            # Calculate the z-coordinate of the bottom of the sphere at this x
+            Z_sphere_bottom = Z_c - np.sqrt(R**2 - (x - X_c)**2)
+            
+            # Penetration depth: how far the water is "pushing" into the ball
+            penetration = eta[i] - Z_sphere_bottom
+            
+            # If the water is touching or passing the ball boundary, apply pressure
+            if penetration > 0:
+                P_ext[i] = stiffness * penetration # Linear Hertzian penalty approximation
+                
+    return P_ext
 
 def verify_with_paper_params():
     cfg = Config()
@@ -190,6 +217,12 @@ def verify_with_paper_params():
     # Small amplitude (0.05 cm) to remain linear
     solver.eta = 0.05 * np.cos(k * x) 
     
+    # Initial State Vectors for the Sphere
+    Z_c = 0.1              # Initial vertical position of the sphere's center (cm)
+    # Using L/2 to drop in the middle since our grid goes from 0 to L
+    X_c = cfg.L / 2.0      # Horizontal center (dropping in the middle of the x-grid)
+    V_c = -15.0            # Initial downward impact velocity (cm/s)
+    
     print("="*60)
     print(f"VERIFICATION: Following Galeano-Rios et al. (2017) Parameters")
     print(f"Fluid: Silicone Oil (20 cSt) with Correction")
@@ -197,17 +230,44 @@ def verify_with_paper_params():
     print(f"  sigma = {cfg.sigma} dyne/cm")
     print(f"  nu    = {cfg.nu:.5f} cm^2/s (corrected from 0.20)")
     print(f"  Grid  = {cfg.nx}x{cfg.nz}, Size={cfg.L}x{cfg.D}cm")
+    print(f"Sphere: Mass={cfg.m:.4e}g, V_c={V_c}cm/s")
     print("="*60)
     
     times, amps = [], []
+    sphere_z, sphere_v = [], []
     
     # Run
     start_t = time.time()
+    dt = cfg.dt
+    dx = cfg.dx
+    
     for i in range(cfg.nt):
+        # 1. Calculate the pressure footprint based on the CURRENT positions
+        P_ext = calculate_hertzian_pressure(x, solver.eta, Z_c, X_c, cfg.R)
+        
+        # 2. Integrate the pressure over the grid to find the total upward force
+        F_fluid = np.sum(P_ext) * dx 
+        
+        # 3. Newton's Second Law (F = ma)
+        # Total Force = Upward Fluid Force - Downward Gravity Weight
+        F_total = F_fluid - (cfg.m * cfg.g)
+        acceleration = F_total / cfg.m
+        
+        # 4. Update the State Vectors (Euler step for the sphere)
+        V_c = V_c + (acceleration * dt)
+        Z_c = Z_c + (V_c * dt)
+        
+        # 5. Now plug P_ext into your dynamic fluid boundary condition!
+        solver.P_ext = P_ext
+        
+        # LNS Solver takes over for this time step
         solver.step()
+        
         if i % 10 == 0:
-            times.append(i * cfg.dt)
+            times.append(i * dt)
             amps.append(np.max(np.abs(solver.eta)))
+            sphere_z.append(Z_c)
+            sphere_v.append(V_c)
             
     print(f"Simulation finished in {time.time()-start_t:.2f}s")
     
